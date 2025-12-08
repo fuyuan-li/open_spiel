@@ -19,7 +19,7 @@ from absl import flags
 from absl import logging
 
 from open_spiel.python import policy
-from open_spiel.python.algorithms import deep_cfr_tf2
+from open_spiel.python.algorithms.tf import deep_cfr_tf2
 from open_spiel.python.algorithms import expected_game_score
 from open_spiel.python.algorithms import exploitability
 import pyspiel

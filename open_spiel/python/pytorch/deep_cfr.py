@@ -34,6 +34,9 @@ import torch.nn.functional as F
 
 from open_spiel.python import policy
 import pyspiel
+from open_spiel.python.algorithms import exploitability, expected_game_score
+from open_spiel.python.policy import tabular_policy_from_callable, python_policy_to_pyspiel_policy
+
 
 AdvantageMemory = collections.namedtuple(
     "AdvantageMemory", "info_state iteration advantage action")
@@ -41,6 +44,12 @@ AdvantageMemory = collections.namedtuple(
 StrategyMemory = collections.namedtuple(
     "StrategyMemory", "info_state iteration strategy_action_probs")
 
+def set_seed(seed):
+  random.seed(seed)
+  np.random.seed(seed)
+  torch.manual_seed(seed)
+  torch.backends.cudnn.deterministic = True
+  torch.backends.cudnn.benchmark = False
 
 class SonnetLinear(nn.Module):
   """A Sonnet linear module.
@@ -218,7 +227,11 @@ class DeepCFRSolver(policy.Policy):
                memory_capacity: int = int(1e6),
                policy_network_train_steps: int = 1,
                advantage_network_train_steps: int = 1,
-               reinitialize_advantage_networks: bool = True):
+               reinitialize_advantage_networks: bool = True,
+               log_nash_conv=False,
+               log_freq=10,
+               logger=None
+               ):
     """Initialize the Deep CFR algorithm.
 
     Args:
@@ -287,6 +300,12 @@ class DeepCFRSolver(policy.Policy):
               self._advantage_networks[p].parameters(), lr=learning_rate))
     self._learning_rate = learning_rate
 
+    self._log_nash_conv = log_nash_conv
+    self._log_freq = log_freq
+    self._logger = logger or print
+    self._nash_conv_history = []
+    self._logger("Finished deep CFR model")
+
   @property
   def advantage_buffers(self):
     return self._advantage_memories
@@ -321,7 +340,8 @@ class DeepCFRSolver(policy.Policy):
       3. (float) Policy loss.
     """
     advantage_losses = collections.defaultdict(list)
-    for _ in range(self._num_iterations):
+    iters, conv_hist, v0_hist, v1_hist = [],[],[],[]
+    for iteration in range(self._num_iterations):
       for p in range(self._num_players):
         for _ in range(self._num_traversals):
           self._traverse_game_tree(self._root_node, p)
@@ -332,8 +352,24 @@ class DeepCFRSolver(policy.Policy):
         advantage_losses[p].append(self._learn_advantage_network(p))
       self._iteration += 1
       # Train policy network.
-    policy_loss = self._learn_strategy_network()
-    return self._policy_network, advantage_losses, policy_loss
+
+      if iteration==0 or self._log_nash_conv and (iteration+1)%(self._log_freq)==0:
+        average_policy = tabular_policy_from_callable(self._game, self.action_probabilities)
+        pyspiel_policy = python_policy_to_pyspiel_policy(average_policy)
+        conv = pyspiel.nash_conv(self._game, pyspiel_policy)
+        self._nash_conv_history.append(conv)
+        self._logger(
+                  f"[DeepCFR][iter {iteration+1}/{self._num_iterations}] "
+                  f"NashConv = {conv:.6f}"
+              )
+        values = expected_game_score.policy_value(self._game.new_initial_state(), [average_policy, average_policy])
+        iters.append(iteration+1)
+        conv_hist.append(conv)
+        v0_hist.append(values[0])
+        v1_hist.append(values[1])
+
+      policy_loss = self._learn_strategy_network()
+    return self._policy_network, advantage_losses, policy_loss, iters, conv_hist, v0_hist, v1_hist
 
   def _traverse_game_tree(self, state, player):
     """Performs a traversal of the game tree.
@@ -513,3 +549,192 @@ class DeepCFRSolver(policy.Policy):
       self._optimizer_policy.step()
 
     return loss_strategy.detach().numpy()
+
+  def debug_overfit_advantage(self,
+                              player: int = 0,
+                              batch_size: int = 1,
+                              num_steps: int = 2000,
+                              lr: float = 0.05):
+    """Fixed-batch overfit test for one player's advantage network.
+
+    目标：在一小批固定样本上反复训练，看 loss 能不能显著下降。
+    """
+
+    import torch
+    import torch.nn as nn
+    import numpy as np
+
+    random.seed(999)
+    np.random.seed(999)
+    torch.manual_seed(999)
+
+    memory = self._advantage_memories[player]
+    if len(memory) == 0:
+      print(f"[OverfitAdv] Player {player} advantage memory is empty.")
+      return
+
+    if batch_size > len(memory):
+      batch_size = len(memory)
+
+    # 1. 只 sample 一次，固定这批数据
+    samples = memory.sample(batch_size)
+
+    info_states = []
+    advantages = []
+    iterations = []
+    for s in samples:
+      info_states.append(s.info_state)
+      advantages.append(s.advantage)
+      iterations.append([s.iteration])
+
+    if not info_states:
+      print(f"[OverfitAdv] No samples collected for player {player}.")
+      return
+
+    info_states = torch.FloatTensor(np.array(info_states))
+    advantages = torch.FloatTensor(np.array(advantages))
+    iters = torch.FloatTensor(np.sqrt(np.array(iterations)))  # 和原训练保持一致
+
+    iters = torch.ones_like(iters)
+
+    net = self._advantage_networks[player]
+    net.train()
+
+    # 用一个单独的 optimizer，避免破坏原来的 optimizer 状态（纯 debug）
+    optimizer = torch.optim.Adam(net.parameters(), lr=lr)
+
+    loss_fn = self._loss_advantages  # 和原代码保持一致（通常是 MSELoss）
+
+    print(f"[OverfitAdv] Start overfitting player {player} on {batch_size} samples "
+          f"for {num_steps} steps (lr={lr}).")
+
+    for step in range(1, num_steps + 1):
+      optimizer.zero_grad()
+      outputs = net(info_states)               # [B, A]
+      loss = loss_fn(iters * outputs, iters * advantages)
+      loss.backward()
+      optimizer.step()
+
+      if step == 1 or step % 500 == 0 or step == num_steps:
+        print(f"[OverfitAdv] step {step:4d}/{num_steps}, loss = {loss.item():.6f}")
+
+      # if step in [1, 100, 500, num_steps]:
+      #   with torch.no_grad():
+      #       pred = net(info_states)
+      #       print("[Sample 0] target:", advantages[0].detach().numpy())
+      #       print("[Sample 0] pred  :", pred[0].detach().numpy())
+
+
+  def debug_advantage_for_state(self, player=0, max_print=50):
+      """从 advantage memory 里找一个频繁出现的 info_state，打印它的所有 advantage。"""
+      import numpy as np
+      from collections import defaultdict
+
+      random.seed(999)
+      np.random.seed(999)
+      torch.manual_seed(999)
+
+      memory = self._advantage_memories[player]
+      if len(memory) == 0:
+          print("[DebugAdvState] empty memory.")
+          return
+
+      # 先数一下每个 info_state 出现了多少次
+      counter = defaultdict(int)
+      for s in memory:
+          key = tuple(s.info_state)  # Kuhn 的 obs 很短，这样做简单粗暴
+          counter[key] += 1
+
+      # 找一个出现次数多的 state
+      key, cnt = max(counter.items(), key=lambda kv: kv[1])
+      print(f"[DebugAdvState] pick info_state={key}, count={cnt}")
+
+      advs = []
+      iters = []
+      for s in memory:
+          if tuple(s.info_state) == key:
+              advs.append(s.advantage)
+              iters.append(s.iteration)
+
+      advs = np.array(advs)
+      iters = np.array(iters)
+
+      print(f"[DebugAdvState] advantages shape={advs.shape}")
+      print(f"[DebugAdvState] iter range: {iters.min()}..{iters.max()}")
+      print(f"[DebugAdvState] per-dim mean: {advs.mean(0)}")
+      print(f"[DebugAdvState] per-dim std : {advs.std(0)}")
+      print(f"[DebugAdvState] per-dim min : {advs.min(0)}")
+      print(f"[DebugAdvState] per-dim max : {advs.max(0)}")
+
+      # 随机抽几条打印出来看 pattern
+      for i in range(min(max_print, len(advs))):
+          print(f"[{i}] iter={iters[i]}, advantage={advs[i]}")
+
+
+  def debug_overfit_advantage_single_state(
+      self,
+      player=0,
+      num_samples=512,
+      num_steps=5000,
+      lr=1e-2,
+      print_every=500,
+  ):
+    random.seed(999)
+    np.random.seed(999)
+    torch.manual_seed(999)
+
+    memory = self.advantage_buffers[player]
+    batch_size = min(num_samples, len(memory))
+    samples = memory.sample(batch_size)
+
+    info_states = [s.info_state for s in samples]
+    advantages = [s.advantage for s in samples]
+    iters = [[s.iteration] for s in samples]
+
+    info_states = torch.FloatTensor(np.array(info_states))
+    advantages = torch.FloatTensor(np.array(advantages))
+    iters = torch.FloatTensor(np.sqrt(np.array(iters)))
+
+    iters = torch.ones_like(iters)
+
+    net = self._advantage_networks[player]
+    net.train()
+
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
+
+    loss_fn = self._loss_advantages
+
+    for step in range(1, num_steps+1):
+        opt.zero_grad()
+        outputs = net(info_states)
+        loss = loss_fn(iters * outputs, iters * advantages)
+        loss.backward()
+        opt.step()
+
+        if step%print_every==0:
+          print(f"[OverfitAdv + 1 State] step{step:4d}/{num_steps}, loss = {loss.item(): .6f}")
+    
+    print(f"[OverfitAdv + 1 State] Now debug 1 info_state")
+
+    counter = collections.defaultdict(int)
+    for s in samples:
+      k = tuple(s.info_state)
+      counter[k] += 1
+
+    max_k, max_cnt = max(counter.items(), key = lambda kv: kv[1])
+    print(f"[OverfitAdv + 1 State] pick info_state={max_k}, count = {max_cnt}")
+    advs = np.array([s.advantage for s in samples if tuple(s.info_state)==max_k])
+    iters = np.array([s.iteration for s in samples if tuple(s.info_state)==max_k])
+    print(f"[OverfitAdv + 1 State] advantages shape={advs.shape}")
+    print(f"[OverfitAdv + 1 State] iter range: {iters.min()}..{iters.max()}")
+    print(f"[OverfitAdv + 1 State] per-dim mean: {advs.mean(0)}")
+    print(f"[OverfitAdv + 1 State] per-dim std : {advs.std(0)}")
+    print(f"[OverfitAdv + 1 State] per-dim min : {advs.min(0)}")
+    print(f"[OverfitAdv + 1 State] per-dim max : {advs.max(0)}")
+
+    print_len = min(10, len(advs))
+    for i in range(print_len):
+        print(f"[{i}] iter={iters[i]}, advantage={advs[i]}")
+
+    for i in range(print_len):
+        print(f"[{print_len-i-1}] iter={iters[-i-1]}, advantage={advs[-i-1]}")

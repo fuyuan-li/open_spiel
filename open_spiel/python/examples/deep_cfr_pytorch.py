@@ -22,6 +22,9 @@ from open_spiel.python import policy
 from open_spiel.python.algorithms import expected_game_score
 import pyspiel
 from open_spiel.python.pytorch import deep_cfr
+import random
+import numpy as np
+import torch
 
 FLAGS = flags.FLAGS
 
@@ -29,45 +32,74 @@ flags.DEFINE_integer("num_iterations", 400, "Number of iterations")
 flags.DEFINE_integer("num_traversals", 40, "Number of traversals/games")
 flags.DEFINE_string("game_name", "kuhn_poker", "Name of the game")
 
+def set_seed(seed):
+  random.seed(seed)
+  np.random.seed(seed)
+  torch.manual_seed(seed)
+  torch.backends.cudnn.deterministic = True
+  torch.backends.cudnn.benchmark = False
 
 def main(unused_argv):
+
   logging.info("Loading %s", FLAGS.game_name)
   game = pyspiel.load_game(FLAGS.game_name)
 
-  deep_cfr_solver = deep_cfr.DeepCFRSolver(
-      game,
-      policy_network_layers=(32, 32),
-      advantage_network_layers=(16, 16),
-      num_iterations=FLAGS.num_iterations,
-      num_traversals=FLAGS.num_traversals,
-      learning_rate=1e-3,
-      batch_size_advantage=None,
-      batch_size_strategy=None,
-      memory_capacity=int(1e7))
+  nashconv, mean_avg_policy_val0, mean_avg_policy_val1 = [], [], [] 
+  for seed in range(100, 120):
+    set_seed(seed)
+    logging.info(f"{seed-99}) th simulation")
+    
+    deep_cfr_solver = deep_cfr.DeepCFRSolver(
+        game,
+        policy_network_layers=(32, 32),
+        advantage_network_layers=(16, 16),
+        num_iterations=FLAGS.num_iterations,
+        num_traversals=FLAGS.num_traversals,
+        learning_rate=1e-3,
+        batch_size_advantage=None,
+        batch_size_strategy=None,
+        memory_capacity=int(1e7),
+        log_nash_conv=True,
+        log_freq=100,
+        )
 
-  _, advantage_losses, policy_loss = deep_cfr_solver.solve()
-  for player, losses in advantage_losses.items():
-    logging.info("Advantage for player %d: %s", player,
-                 losses[:2] + ["..."] + losses[-2:])
-    logging.info("Advantage Buffer Size for player %s: '%s'", player,
-                 len(deep_cfr_solver.advantage_buffers[player]))
-  logging.info("Strategy Buffer Size: '%s'",
-               len(deep_cfr_solver.strategy_buffer))
-  logging.info("Final policy loss: '%s'", policy_loss)
+    _, advantage_losses, policy_loss = deep_cfr_solver.solve()
+    logging.info("Per-iteration NashConv history: %s", deep_cfr_solver._nash_conv_history)
 
-  average_policy = policy.tabular_policy_from_callable(
-      game, deep_cfr_solver.action_probabilities)
-  pyspiel_policy = policy.python_policy_to_pyspiel_policy(average_policy)
-  conv = pyspiel.nash_conv(game, pyspiel_policy)
-  logging.info("Deep CFR in '%s' - NashConv: %s", FLAGS.game_name, conv)
+    for player, losses in advantage_losses.items():
+      logging.info("Advantage for player %d: %s", player,
+                  losses[:2] + ["..."] + losses[-2:])
+      logging.info("Advantage Buffer Size for player %s: '%s'", player,
+                  len(deep_cfr_solver.advantage_buffers[player]))
+    logging.info("Strategy Buffer Size: '%s'",
+                len(deep_cfr_solver.strategy_buffer))
+    logging.info("Final policy loss: '%s'", policy_loss)
+    
+    average_policy = policy.tabular_policy_from_callable(
+        game, deep_cfr_solver.action_probabilities)
+    pyspiel_policy = policy.python_policy_to_pyspiel_policy(average_policy)
+    conv = pyspiel.nash_conv(game, pyspiel_policy)
+    logging.info("Deep CFR in '%s' - NashConv: %s", FLAGS.game_name, conv)
 
-  average_policy_values = expected_game_score.policy_value(
-      game.new_initial_state(), [average_policy] * 2)
-  logging.info("Computed player 0 value: %.2f (expected: %.2f).",
-               average_policy_values[0], -1 / 18)
-  logging.info("Computed player 1 value: %.2f (expected: %.2f).",
-               average_policy_values[1], 1 / 18)
+    average_policy_values = expected_game_score.policy_value(
+        game.new_initial_state(), [average_policy] * 2)
+    logging.info("Computed player 0 value: %.2f (expected: %.2f).",
+                average_policy_values[0], -1 / 18)
+    logging.info("Computed player 1 value: %.2f (expected: %.2f).",
+                average_policy_values[1], 1 / 18)
+    
+    logging.info("Start fixed batch overfitting")
+  # deep_cfr_solver.debug_overfit_advantage(0)
+  # deep_cfr_solver.debug_advantage_for_state(0)
+  # deep_cfr_solver.debug_overfit_advantage_single_state(0)
 
+    nashconv.append(conv)
+    mean_avg_policy_val0.append(average_policy_values[0])
+    mean_avg_policy_val1.append(average_policy_values[1])
+
+    logging.info(f"player 0 averaged value = {np.mean(mean_avg_policy_val0)}")
+    logging.info(f"player 1 averaged value = {np.mean(mean_avg_policy_val1)}")
+    logging.info(f"averaged NashConv = {np.mean(nashconv)}")
 
 if __name__ == "__main__":
   app.run(main)
