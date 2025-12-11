@@ -304,7 +304,6 @@ class DeepCFRSolver(policy.Policy):
     self._log_freq = log_freq
     self._logger = logger or print
     self._nash_conv_history = []
-    self._logger("Finished deep CFR model")
 
   @property
   def advantage_buffers(self):
@@ -353,7 +352,7 @@ class DeepCFRSolver(policy.Policy):
       self._iteration += 1
       # Train policy network.
 
-      if iteration==0 or self._log_nash_conv and (iteration+1)%(self._log_freq)==0:
+      if self._log_nash_conv and (iteration+1)%(self._log_freq)==0:
         average_policy = tabular_policy_from_callable(self._game, self.action_probabilities)
         pyspiel_policy = python_policy_to_pyspiel_policy(average_policy)
         conv = pyspiel.nash_conv(self._game, pyspiel_policy)
@@ -368,8 +367,8 @@ class DeepCFRSolver(policy.Policy):
         v0_hist.append(values[0])
         v1_hist.append(values[1])
 
-      policy_loss = self._learn_strategy_network()
-    return self._policy_network, advantage_losses, policy_loss, iters, conv_hist, v0_hist, v1_hist
+    policy_loss = self._learn_strategy_network()
+    return self._policy_network, advantage_losses, policy_loss
 
   def _traverse_game_tree(self, state, player):
     """Performs a traversal of the game tree.
@@ -508,6 +507,7 @@ class DeepCFRSolver(policy.Policy):
       self._optimizer_advantages[player].zero_grad()
       advantages = torch.FloatTensor(np.array(advantages))
       iters = torch.FloatTensor(np.sqrt(np.array(iterations)))
+      # iters = torch.ones_like(iters)
       outputs = self._advantage_networks[player](
           torch.FloatTensor(np.array(info_states)))
       loss_advantages = self._loss_advantages(iters * outputs,
@@ -541,6 +541,7 @@ class DeepCFRSolver(policy.Policy):
 
       self._optimizer_policy.zero_grad()
       iters = torch.FloatTensor(np.sqrt(np.array(iterations)))
+      # iters = torch.ones_like(iters)
       ac_probs = torch.FloatTensor(np.array(np.squeeze(action_probs)))
       logits = self._policy_network(torch.FloatTensor(np.array(info_states)))
       outputs = self._policy_sm(logits)
